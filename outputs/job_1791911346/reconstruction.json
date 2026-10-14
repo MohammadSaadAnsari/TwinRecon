@@ -1,0 +1,15 @@
+{
+  "job_id": "job_1791911346",
+  "input_video": "/home/saad/TwinRecon/data/inputs/test_object.mp4",
+  "total_time_seconds": 1.44,
+  "frames_processed": 30,
+  "points_count": 500,
+  "outputs": {
+    "point_cloud": "pointcloud/dense_point_cloud.ply",
+    "gaussian_splat": "gaussian_splat/gaussian_splat.ply"
+  },
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 2050",
+    "vram_limit_gb": 4.0
+  }
+}
