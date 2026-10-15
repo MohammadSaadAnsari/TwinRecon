@@ -5,13 +5,13 @@ import time
 import shutil
 import argparse
 import subprocess
-import torch
 import numpy as np
 import cv2
+import torch
 import open3d as o3d
 from plyfile import PlyData, PlyElement
 
-def extract_frames(video_path, output_dir, target_frames=50, max_dim=960):
+def extract_frames(video_path, output_dir, target_frames=60, max_dim=960):
     os.makedirs(output_dir, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened(): raise RuntimeError(f"Cannot open video: {video_path}")
@@ -35,7 +35,7 @@ def extract_frames(video_path, output_dir, target_frames=50, max_dim=960):
     print(f"[Stage 1] Extracted {count} high-resolution frames.")
     return count
 
-def run_colmap_mvs(images_dir, workspace_dir):
+def run_colmap_mvs_dark_surface_tuned(images_dir, workspace_dir):
     db = os.path.join(workspace_dir, "database.db")
     sparse = os.path.join(workspace_dir, "sparse")
     mvs_dir = os.path.join(workspace_dir, "mvs")
@@ -44,17 +44,22 @@ def run_colmap_mvs(images_dir, workspace_dir):
     os.makedirs(sparse, exist_ok=True)
     os.makedirs(mvs_dir, exist_ok=True)
     
+    print("[Stage 2.1] Extracting high-density SIFT keypoints...")
     subprocess.run([
         "colmap", "feature_extractor",
         "--database_path", db,
         "--image_path", images_dir,
         "--ImageReader.single_camera", "1",
         "--ImageReader.camera_model", "SIMPLE_RADIAL",
-        "--SiftExtraction.max_num_features", "12000"
+        "--SiftExtraction.max_num_features", "16000",
+        "--SiftExtraction.peak_threshold", "0.002"
     ], check=True)
     
+    print("[Stage 2.2] Matching camera views...")
     subprocess.run(["colmap", "exhaustive_matcher", "--database_path", db], check=True)
     subprocess.run(["colmap", "sequential_matcher", "--database_path", db], check=True)
+    
+    print("[Stage 2.3] Solving sparse camera trajectory...")
     subprocess.run(["colmap", "mapper", "--database_path", db, "--image_path", images_dir, "--output_path", sparse], check=True)
     
     subdirs = [d for d in os.listdir(sparse) if os.path.isdir(os.path.join(sparse, d))]
@@ -64,24 +69,29 @@ def run_colmap_mvs(images_dir, workspace_dir):
     best_subdir = max(subdirs, key=lambda sd: os.path.getsize(os.path.join(sparse, sd, "points3D.bin")) if os.path.exists(os.path.join(sparse, sd, "points3D.bin")) else 0)
     sparse_model_path = os.path.join(sparse, best_subdir)
 
+    print("[Stage 2.4] Undistorting images for Multi-View Stereo...")
     subprocess.run([
         "colmap", "image_undistorter",
         "--image_path", images_dir,
         "--input_path", sparse_model_path,
         "--output_path", mvs_dir,
         "--output_type", "COLMAP",
-        "--max_image_size", "800"
+        "--max_image_size", "960"
     ], check=True)
 
+    # Low-contrast PatchMatch parameters for dark/black surfaces
+    print("[Stage 2.5] Computing GPU depth maps (Tuned for dark/matte surfaces)...")
     subprocess.run([
         "colmap", "patch_match_stereo",
         "--workspace_path", mvs_dir,
         "--workspace_format", "COLMAP",
-        "--PatchMatchStereo.max_image_size", "800",
-        "--PatchMatchStereo.window_radius", "5",
-        "--PatchMatchStereo.num_iterations", "3"
+        "--PatchMatchStereo.max_image_size", "960",
+        "--PatchMatchStereo.window_radius", "7",
+        "--PatchMatchStereo.num_iterations", "4",
+        "--PatchMatchStereo.filter_min_ncc", "0.02"
     ], check=True)
 
+    print("[Stage 2.6] Fusing depth maps into dense point cloud...")
     fused_success = False
     for cmd in ["stereo_fusion", "dense_fuser", "stereo_fuser"]:
         try:
@@ -90,6 +100,7 @@ def run_colmap_mvs(images_dir, workspace_dir):
                 "--workspace_path", mvs_dir,
                 "--workspace_format", "COLMAP",
                 "--input_type", "geometric",
+                "--StereoFusion.min_num_pixels", "2",
                 "--output_path", fused_ply
             ], check=True)
             fused_success = True
@@ -98,20 +109,19 @@ def run_colmap_mvs(images_dir, workspace_dir):
             continue
 
     if not fused_success:
-        raise RuntimeError("Failed to run COLMAP depth map fusion.")
+        raise RuntimeError("Failed to fuse depth maps into dense point cloud.")
 
     return fused_ply
 
-def convert_mvs_to_gaussian_splat(fused_ply_path, output_ply_path, remove_ground=True):
+def convert_mvs_to_solid_gsplat(fused_ply_path, output_splat_path, output_dense_path):
     pcd = o3d.io.read_point_cloud(fused_ply_path)
     if len(pcd.points) == 0:
-        raise RuntimeError("Stereo fuser produced 0 points.")
+        raise RuntimeError("Fused MVS point cloud is empty.")
 
-    # Statistical outlier removal
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.2)
+    print(f"[Stage 3.1] Cleaning floaters & auto-cropping floor plane...")
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=0.8)
 
-    # RANSAC Plane Segmentation (Remove Floor / Table)
-    if remove_ground and len(pcd.points) > 1000:
+    if len(pcd.points) > 2000:
         plane_model, inliers = pcd.segment_plane(distance_threshold=0.015, ransac_n=3, num_iterations=1000)
         pcd = pcd.select_by_index(inliers, invert=True)
 
@@ -124,17 +134,18 @@ def convert_mvs_to_gaussian_splat(fused_ply_path, output_ply_path, remove_ground
     pcd_centered = o3d.geometry.PointCloud()
     pcd_centered.points = o3d.utility.Vector3dVector(pts)
     pcd_centered.colors = o3d.utility.Vector3dVector(cols)
-    distances = np.asarray(pcd_centered.compute_nearest_neighbor_distance())
-    distances = np.maximum(distances, 0.0005)
+    o3d.io.write_point_cloud(output_dense_path, pcd_centered)
 
-    scales = np.log(np.tile(distances[:, None] * 0.45, (1, 3))).astype(np.float32)
+    distances = np.asarray(pcd_centered.compute_nearest_neighbor_distance())
+    distances = np.maximum(distances, 0.0003)
+    scales = np.log(np.tile(distances[:, None] * 0.95, (1, 3))).astype(np.float32)
 
     N = len(pts)
     normals = np.zeros((N, 3), dtype=np.float32)
     C0 = 0.28209479177387814
     f_dc = (cols - 0.5) / C0
 
-    opacities = np.full((N, 1), 3.0, dtype=np.float32)
+    opacities = np.full((N, 1), 4.5, dtype=np.float32)
     quats = np.zeros((N, 4), dtype=np.float32)
     quats[:, 0] = 1.0
 
@@ -153,13 +164,12 @@ def convert_mvs_to_gaussian_splat(fused_ply_path, output_ply_path, remove_ground
     for idx, name in enumerate([d[0] for d in dtype]):
         elements[name] = data[:, idx]
 
-    PlyData([PlyElement.describe(elements, 'vertex')], text=False).write(output_ply_path)
-    o3d.io.write_point_cloud(fused_ply_path.replace("fused.ply", "centered_dense.ply"), pcd_centered)
-    print(f"[Stage 3] Exported {N:,} isolated surface Gaussians (floor auto-cropped) to {output_ply_path}")
+    PlyData([PlyElement.describe(elements, 'vertex')], text=False).write(output_splat_path)
+    print(f"[Stage 3.2] Exported {N:,} dense, low-contrast recovery Gaussians to {output_splat_path}")
     return N
 
 def main():
-    parser = argparse.ArgumentParser(description="TwinRecon MVS Pipeline")
+    parser = argparse.ArgumentParser(description="TwinRecon Dark-Surface Tuned Pipeline")
     parser.add_argument("--video", type=str, required=True, help="Input video path")
     args = parser.parse_args()
     
@@ -180,16 +190,11 @@ def main():
     final_splat_ply = os.path.join(splat_dir, "gaussian_splat.ply")
     report_json = os.path.join(output_root, "reconstruction.json")
     
-    num_frames = extract_frames(args.video, images_dir, target_frames=50, max_dim=960)
+    num_frames = extract_frames(args.video, images_dir, target_frames=60, max_dim=960)
+    fused_mvs_ply = run_colmap_mvs_dark_surface_tuned(images_dir, work_dir)
     
-    try:
-        fused_mvs_ply = run_colmap_mvs(images_dir, work_dir)
-        num_points = convert_mvs_to_gaussian_splat(fused_mvs_ply, final_splat_ply, remove_ground=True)
-        shutil.copyfile(fused_mvs_ply.replace("fused.ply", "centered_dense.ply"), final_dense_ply)
-    except Exception as err:
-        print(f"\n[ERROR] Dense reconstruction failed: {err}")
-        sys.exit(1)
-        
+    num_points = convert_mvs_to_solid_gsplat(fused_mvs_ply, final_splat_ply, final_dense_ply)
+    
     shutil.rmtree(work_dir, ignore_errors=True)
     elapsed = round(time.time() - start_time, 2)
     
@@ -213,7 +218,7 @@ def main():
         json.dump(report, f, indent=2)
         
     print("\n" + "="*50)
-    print("TWINRECON DENSE RECONSTRUCTION COMPLETE")
+    print("TWINRECON RECONSTRUCTION COMPLETE")
     print(f"Job Output Root : {output_root}")
     print(f"Dense Pointcloud: {final_dense_ply}")
     print(f"Gaussian Splat  : {final_splat_ply}")
