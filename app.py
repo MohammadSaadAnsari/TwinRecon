@@ -164,14 +164,15 @@ def start_job():
 @app.get("/api/jobs/<job_id>/files/<key>")
 def download(job_id, key):
     if key not in {"point_cloud", "gaussian_splat", "poisson_mesh", "consistency_map",
-                   "cameras", "segmentation_preview"}:
+                   "confidence_atlas", "atlas_data", "cameras", "segmentation_preview"}:
         abort(404)
     return send_file(_artifact(_job_dir(job_id), key), as_attachment=key != "segmentation_preview")
 
 
 @app.get("/api/jobs/<job_id>/preview/<kind>")
 def point_preview(job_id, kind):
-    key = {"cloud": "point_cloud", "consistency": "consistency_map", "splats": "gaussian_splat"}.get(kind)
+    key = {"cloud": "point_cloud", "consistency": "consistency_map",
+           "atlas": "confidence_atlas", "splats": "gaussian_splat"}.get(kind)
     if key is None:
         abort(404)
     folder = _job_dir(job_id)
@@ -188,6 +189,35 @@ def point_preview(job_id, kind):
     except (ValueError, KeyError) as exc:
         return jsonify({"error": str(exc)}), 422
     return app.response_class(packed, mimetype="application/octet-stream")
+
+
+@app.get("/api/jobs/<job_id>/atlas")
+def atlas_data(job_id):
+    return send_file(_artifact(_job_dir(job_id), "atlas_data"), mimetype="application/json")
+
+
+@app.get("/api/compare")
+def compare_jobs():
+    before_id, after_id = request.args.get("before", ""), request.args.get("after", "")
+    if before_id == after_id:
+        return jsonify({"error": "Choose two different scans."}), 400
+    before = json.loads(_artifact(_job_dir(before_id), "atlas_data").read_text())
+    after = json.loads(_artifact(_job_dir(after_id), "atlas_data").read_text())
+
+    def metrics(atlas):
+        regions = atlas.get("regions", [])
+        weights = [region["points"] for region in regions]
+        total = max(sum(weights), 1)
+        return {"weak_fraction": atlas["weak_region_fraction_by_points"],
+                "floater_regions": atlas["floater_candidates"],
+                "mean_camera_support": sum(region["camera_support"]*weight for region, weight in zip(regions, weights))/total,
+                "mean_silhouette_agreement": sum(region["silhouette_agreement"]*weight for region, weight in zip(regions, weights))/total,
+                "mean_image_error": sum(region["image_render_error"]*weight for region, weight in zip(regions, weights))/total,
+                "mean_cloud_mesh_distance": sum(region["cloud_mesh_distance"]*weight for region, weight in zip(regions, weights))/total}
+
+    return jsonify({"before_job": before_id, "after_job": after_id,
+                    "before": metrics(before), "after": metrics(after),
+                    "note": "Independent regional summaries. SfM scale and coordinates can differ; distances and region locations are not directly aligned."})
 
 
 if __name__ == "__main__":

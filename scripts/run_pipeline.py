@@ -15,6 +15,7 @@ import numpy as np
 
 from geometry import clean_object_cloud, export_gaussians
 from mesh import consistency_map, create_mesh
+from atlas import build_confidence_atlas
 from segmentation import read_colmap_text, segment_images
 
 
@@ -179,6 +180,25 @@ def run(args):
         report["outputs"]["gaussian_splat"] = str(splat_file.relative_to(root))
         save()
 
+        if not args.no_refine:
+            LOG.info("Stage 3.5 | Validation-gated gsplat color and shape refinement")
+            try:
+                from refinement import refine_splats
+                refined = refine_splats(splat_file, views, center, images, masks,
+                                        max_gaussians=args.refine_max_splats,
+                                        max_steps=args.refine_steps)
+                report["stages"]["refinement"] = refined
+                report["sh_coefficients_estimated"] = refined["sh_accepted"]
+                LOG.info("Refinement | %s | %s", refined["status"], refined.get("reason") or
+                         f"held-out loss {refined['validation_before']:.4f} -> {refined['validation_final']:.4f}")
+            except Exception as exc:
+                LOG.exception("Refinement failed; measured MVS splat remains available")
+                report["stages"]["refinement"] = {"status": "failed", "reason": str(exc)}
+            save()
+        else:
+            report["stages"]["refinement"] = {"status": "skipped", "reason": "disabled by --no-refine"}
+            save()
+
         if not args.no_mesh:
             LOG.info("Stage 4 | Fitting Poisson mesh")
             mesh_file = root / "mesh" / "poisson_mesh.ply"
@@ -190,6 +210,18 @@ def run(args):
             diagnostic_file = root / "diagnostics" / "consistency.ply"
             report["stages"]["consistency"] = consistency_map(cloud, mesh, diagnostic_file)
             report["outputs"]["consistency_map"] = str(diagnostic_file.relative_to(root))
+            save()
+            LOG.info("Stage 6 | Building regional confidence atlas and capture compass")
+            try:
+                atlas_file = root / "diagnostics" / "confidence_atlas.ply"
+                atlas_json = root / "diagnostics" / "confidence_atlas.json"
+                report["stages"]["atlas"] = build_confidence_atlas(
+                    cloud, mesh, views, center, images, masks, atlas_file, atlas_json)
+                report["outputs"]["confidence_atlas"] = str(atlas_file.relative_to(root))
+                report["outputs"]["atlas_data"] = str(atlas_json.relative_to(root))
+            except Exception as exc:
+                LOG.exception("Confidence atlas could not be built")
+                report["stages"]["atlas"] = {"status": "failed", "reason": str(exc)}
 
         report["points_count"] = len(cloud.points)
         report["total_time_seconds"] = round(time.time() - start, 2)
@@ -221,9 +253,14 @@ def main():
     parser.add_argument("--mesh-depth", type=int, choices=range(6, 11), default=8)
     parser.add_argument("--no-mesh", action="store_true")
     parser.add_argument("--keep-work", action="store_true")
+    parser.add_argument("--no-refine", action="store_true", help="Skip gsplat even when CUDA is available")
+    parser.add_argument("--refine-max-splats", type=int, default=80000)
+    parser.add_argument("--refine-steps", type=int, default=32)
     args = parser.parse_args()
     if args.frames < 3 or args.max_dim < 128 or args.max_splats < 1000:
         parser.error("frames >= 3, max-dim >= 128 and max-splats >= 1000 are required")
+    if not 1000 <= args.refine_max_splats <= 120000 or not 1 <= args.refine_steps <= 100:
+        parser.error("refine-max-splats must be 1,000–120,000 and refine-steps 1–100")
     run(args)
 
 
